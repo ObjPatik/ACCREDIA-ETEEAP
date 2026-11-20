@@ -1,0 +1,118 @@
+import axios from 'axios';
+
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000';
+export const API = `${BACKEND_URL.replace(/\/$/, '')}/api`;
+
+const apiClient = axios.create({
+  baseURL: API,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem('access_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('access_token');
+      localStorage.removeItem('refresh_token');
+      localStorage.removeItem('user');
+      if (!window.location.pathname.includes('/login') && !window.location.pathname.includes('/register') && window.location.pathname !== '/') {
+        window.location.href = '/login';
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default apiClient;
+
+export const authApi = {
+  register: (data) => apiClient.post('/auth/register/', data),
+  login: (data) => apiClient.post('/auth/login/', data),
+  googleAuth: (token) => apiClient.post('/auth/google/', { token }),
+  me: () => apiClient.get('/auth/me/'),
+  updateProfile: (data) => apiClient.patch('/auth/profile/', data),
+  changePassword: (data) => apiClient.post('/auth/change-password/', data),
+};
+
+export const applicationApi = {
+  list: (params = {}) => apiClient.get('/applications/', { params }),
+  create: (data) => apiClient.post('/applications/', data),
+  get: (id) => apiClient.get(`/applications/${id}/`),
+  update: (id, data) => apiClient.patch(`/applications/${id}/`, data),
+  delete: (id) => apiClient.delete(`/applications/${id}/`),
+  submit: (id) => apiClient.post(`/applications/${id}/submit/`),
+  reopen: (id) => apiClient.post(`/applications/${id}/reopen/`),
+  finalize: (id, data) => apiClient.post(`/applications/${id}/finalize/`, typeof data === 'string' ? { evaluator_note: data } : (data || {})),
+  reject: (id, data) => apiClient.post(`/applications/${id}/reject/`, typeof data === 'string' ? { evaluator_note: data } : (data || {})),
+  process: (id) => apiClient.post('/application/process/', { application_id: id }),
+  runFullEvaluation: (id) => apiClient.post('/application/process/', { application_id: id }),
+  summary: (id) => apiClient.get(`/applications/${id}/summary/`),
+};
+
+export const documentApi = {
+  list: (applicationId) => apiClient.get(`/documents/?application_id=${applicationId}`),
+  upload: (data) => apiClient.post('/upload/document/', data),
+  delete: (documentId) => apiClient.delete(`/documents/${documentId}/`),
+  reprocess: (documentId) => apiClient.post(`/documents/${documentId}/reprocess/`),
+  previewUrl: (documentId) => `${API}/documents/${documentId}/preview/`,
+  preview: (documentId) => apiClient.get(`/documents/${documentId}/preview/`, { responseType: 'blob' }),
+};
+
+export const workExperienceApi = {
+  list: (applicationId) => apiClient.get(`/work-experiences/?application_id=${applicationId}`),
+  add: (data) => apiClient.post('/work-experience/add/', data),
+  delete: (id) => apiClient.delete(`/work-experiences/${id}/`),
+  update: (id, data) => apiClient.patch(`/work-experiences/${id}/`, data),
+};
+
+export const subjectMatchApi = {
+  list: (applicationId) => apiClient.get(`/subject-matches/?application_id=${applicationId}`),
+  create: (data) => apiClient.post('/subject-matches/', data),
+  delete: (id) => apiClient.delete(`/subject-matches/${id}/`),
+  flag: (id, note) => apiClient.post(`/subject-matches/${id}/flag/`, { note }),
+  approve: (id, note) => apiClient.post(`/subject-matches/${id}/approve/`, { note }),
+  reject: (id, note) => apiClient.post(`/subject-matches/${id}/reject/`, { note }),
+  override: (id, data) => apiClient.post(`/subject-matches/${id}/override/`, data),
+  disregardTorSubject: (applicationId, torSubjectId, note) =>
+    apiClient.post('/subject-matches/disregard-tor-subject/', {
+      application_id: applicationId,
+      tor_subject_id: torSubjectId,
+      note,
+    }),
+};
+
+export const programApi = {
+  list: () => apiClient.get('/programs/'),
+  curriculum: (programId) => apiClient.get(`/curriculum-subjects/?program_id=${programId}`),
+};
+
+export const curriculumApi = {
+  parse: (data) => apiClient.post('/upload/curriculum/', { ...data, preview: true }),
+  upload: (data) => apiClient.post('/upload/curriculum/', data),
+};
+
+export const predictionApi = {
+  get: (applicationId) => apiClient.get(`/predictions/?application_id=${applicationId}`),
+};
+
+export const chatApi = {
+  sendMessage: (data) => apiClient.post('/chat/message/', data),
+};
+
+export const dashboardApi = {
+  getStats: () => apiClient.get('/dashboard/stats/'),
+};
+
+export const courseApi = {
+  recommend: (workExperiences) => apiClient.post('/recommend-course/', { work_experiences: workExperiences }),
+};

@@ -1,0 +1,918 @@
+from rest_framework import viewsets, status, permissions
+from rest_framework.decorators import api_view, permission_classes, action
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework_simplejwt.tokens import RefreshToken
+from asgiref.sync import async_to_sync
+from django.conf import settings
+from django.utils import timezone
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+import os
+import base64
+import json
+import uuid
+from dotenv import load_dotenv
+
+from .models import (
+    User, Program, CurriculumSubject, Application,
+    TORDocument, TORSubject, SubjectMatch, Prediction,
+    Report, ChatConversation, ChatMessage,
+    WorkExperience, ApplicantDocument
+)
+from .serializers import (
+    UserSerializer, RegisterSerializer, LoginSerializer,
+    ProgramSerializer, CurriculumSubjectSerializer,
+    ApplicationSerializer, TORDocumentSerializer,
+    TORSubjectSerializer, SubjectMatchSerializer,
+    PredictionSerializer, ReportSerializer,
+    ChatConversationSerializer, ChatMessageSerializer,
+    WorkExperienceSerializer, ApplicantDocumentSerializer
+)
+from .gemini_service import gemini_service
+
+load_dotenv()
+
+IT_KEYWORDS = {
+    'it', 'information technology', 'software', 'developer', 'programmer',
+    'web', 'database', 'network', 'systems', 'system admin', 'devops',
+    'qa', 'test automation', 'cybersecurity', 'cloud', 'data analyst',
+    'ui', 'ux', 'frontend', 'backend', 'full stack', 'technical support'
+}
+
+
+def _is_it_related_work_data(job_title, job_description):
+    return _is_it_related_text(f"{job_title or ''} {job_description or ''}")
+
+
+def _get_work_experience_evidence(application):
+    work_experiences = list(WorkExperience.objects.filter(application=application).values(
+        'job_title', 'years', 'job_description'
+    ))
+
+    job_description_docs = ApplicantDocument.objects.filter(
+        application=application,
+        document_type='job_description',
+        ocr_status='completed'
+    )
+
+    for doc in job_description_docs:
+        parsed_data = {}
+        for raw_value in [doc.ocr_raw, doc.extracted_text]:
+            if not raw_value:
+                continue
+            try:
+                parsed_data = json.loads(raw_value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed_data, dict):
+                break
+            parsed_data = {}
+
+        if isinstance(parsed_data, dict) and parsed_data.get('job_title'):
+            years_value = parsed_data.get('years', 0) or 0
+            try:
+                years_value = float(years_value)
+            except (TypeError, ValueError):
+                years_value = 0
+
+            work_experiences.append({
+                'job_title': parsed_data.get('job_title', ''),
+                'years': years_value,
+                'job_description': parsed_data.get('job_description', ''),
+            })
+
+    return work_experiences
+
+
+def _is_it_related_text(text):
+    normalized = (text or '').lower()
+    return any(keyword in normalized for keyword in IT_KEYWORDS)
+
+
+def _tor_meets_bsit_two_year_requirement(application):
+    tor_subjects = TORSubject.objects.filter(application=application)
+    if not tor_subjects.exists():
+        return False, 'TOR analysis not found. Please upload a readable TOR first.'
+
+    total_units = sum(max(subject.units or 0, 0) for subject in tor_subjects)
+    it_related_subjects = 0
+
+    for subject in tor_subjects:
+        subject_text = f"{subject.code} {subject.title}"
+        if _is_it_related_text(subject_text):
+            it_related_subjects += 1
+
+    # 2 academic years is typically around 60 units; require a minimum IT density as well.
+    if total_units < 60:
+        return False, f'TOR has only {total_units} units. At least 60 units (2 years) is required for BSIT ETEEAP.'
+
+    if it_related_subjects < 8:
+        return False, (
+            'TOR does not show enough BSIT-related coursework '
+            f'({it_related_subjects} IT-related subjects found, minimum is 8).'
+        )
+
+    return True, ''
+
+
+def _work_experience_is_it_related(application):
+    work_experiences = _get_work_experience_evidence(application)
+    if not work_experiences:
+        return False, 'At least one IT-related work experience is required before submission.'
+
+    if not any(_is_it_related_work_data(exp.get('job_title'), exp.get('job_description')) for exp in work_experiences):
+        return False, 'Work experience is not clearly IT-related.'
+
+    return True, ''
+
+
+def _ai_supports_bsit_fit(application):
+    work_experiences = _get_work_experience_evidence(application)
+    if not work_experiences:
+        return False, 'At least one work experience entry is required.'
+
+    recommendation = async_to_sync(gemini_service.recommend_program)(work_experiences)
+    recommended_program = str(recommendation.get('program', '')).strip().upper()
+    reasoning = str(recommendation.get('reasoning', '')).strip()
+
+    # If AI service is unavailable and returns fallback, rely on deterministic checks only.
+    fallback_markers = {'local fallback recommendation', 'default recommendation'}
+    if reasoning.lower() in fallback_markers:
+        return True, ''
+
+    if recommended_program and recommended_program != 'BSIT':
+        reason = reasoning or f'AI recommended {recommended_program} instead of BSIT.'
+        return False, f'Work role is not aligned to BSIT. {reason}'
+
+    return True, ''
+
+
+def _collect_bsit_prequalification_failures(application):
+    failures = []
+
+    is_tor_eligible, tor_message = _tor_meets_bsit_two_year_requirement(application)
+    if not is_tor_eligible and tor_message:
+        failures.append(tor_message)
+
+    is_work_eligible, work_message = _work_experience_is_it_related(application)
+    if not is_work_eligible and work_message:
+        failures.append(work_message)
+
+    # Run AI fit check only if basic work requirement passed.
+    if is_work_eligible:
+        ai_fit_ok, ai_message = _ai_supports_bsit_fit(application)
+        if not ai_fit_ok and ai_message:
+            failures.append(ai_message)
+
+    return failures
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def register(request):
+    serializer = RegisterSerializer(data=request.data)
+    if serializer.is_valid():
+        user = serializer.save()
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'user': UserSerializer(user).data,
+            'access': str(refresh.access_token),
+            'refresh': str(refresh)
+        }, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login(request):
+    serializer = LoginSerializer(data=request.data)
+    if serializer.is_valid():
+        user = serializer.validated_data['user']
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'user': UserSerializer(user).data,
+            'access': str(refresh.access_token),
+            'refresh': str(refresh)
+        })
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def google_auth(request):
+    # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+    token = request.data.get('token')
+    if not token:
+        return Response({'error': 'Token required'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            token, 
+            google_requests.Request(), 
+            settings.GOOGLE_CLIENT_ID
+        )
+        
+        email = idinfo['email']
+        google_id = idinfo['sub']
+        full_name = idinfo.get('name', email.split('@')[0])
+        
+        user, created = User.objects.get_or_create(
+            email=email,
+            defaults={
+                'full_name': full_name,
+                'google_id': google_id,
+                'role': 'applicant'
+            }
+        )
+        
+        if not user.google_id:
+            user.google_id = google_id
+            user.save()
+        
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'user': UserSerializer(user).data,
+            'access': str(refresh.access_token),
+            'refresh': str(refresh)
+        })
+    
+    except ValueError as e:
+        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['GET', 'PATCH', 'PUT'])
+@permission_classes([IsAuthenticated])
+def me(request):
+    if request.method in ['PATCH', 'PUT']:
+        full_name = request.data.get('full_name')
+        if not full_name or not str(full_name).strip():
+            return Response({'error': 'Full name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        user = request.user
+        user.full_name = str(full_name).strip()
+        user.save()
+        return Response(UserSerializer(user).data)
+    return Response(UserSerializer(request.user).data)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def change_password(request):
+    user = request.user
+    current_password = request.data.get('current_password')
+    new_password = request.data.get('new_password')
+    confirm_password = request.data.get('confirm_password')
+
+    if not new_password:
+        return Response({'error': 'New password is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    
+    if len(str(new_password)) < 8:
+        return Response({'error': 'New password must be at least 8 characters long.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if confirm_password and new_password != confirm_password:
+        return Response({'error': 'New password and confirmation do not match.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # If user has a usable password, check current_password
+    if user.has_usable_password():
+        if not current_password:
+            return Response({'error': 'Current password is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not user.check_password(current_password):
+            return Response({'error': 'Current password is incorrect.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(new_password)
+    user.save()
+
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        'message': 'Password updated successfully.',
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+        'user': UserSerializer(user).data
+    })
+
+class ProgramViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Program.objects.all()
+    serializer_class = ProgramSerializer
+    permission_classes = [AllowAny]
+
+class CurriculumSubjectViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = CurriculumSubjectSerializer
+    permission_classes = [AllowAny]
+    
+    def get_queryset(self):
+        queryset = CurriculumSubject.objects.all().order_by('year', 'semester', 'code')
+        program_id = self.request.query_params.get('program_id')
+        if program_id:
+            queryset = queryset.filter(program_id=program_id)
+        return queryset
+
+class ApplicationViewSet(viewsets.ModelViewSet):
+    serializer_class = ApplicationSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        program_id = self.request.query_params.get('program_id')
+        if user.role == 'admin':
+            qs = Application.objects.all().order_by('-created_at')
+            if program_id:
+                qs = qs.filter(program_id=program_id)
+            return qs
+        elif user.role == 'evaluator':
+            qs = Application.objects.exclude(status='draft').order_by('-created_at')
+            if program_id:
+                qs = qs.filter(program_id=program_id)
+            return qs
+        else:
+            qs = Application.objects.filter(applicant=user).order_by('-created_at')
+            if program_id:
+                qs = qs.filter(program_id=program_id)
+            return qs
+    
+    def create(self, request):
+        program_id = request.data.get('program_id')
+        if not program_id:
+            # Auto-assign BSIT as default
+            program = Program.objects.filter(code='BSIT').first()
+            if not program:
+                return Response({'error': 'No program available'}, status=status.HTTP_400_BAD_REQUEST)
+            program_id = str(program.id)
+        
+        application = Application.objects.create(
+            applicant=request.user,
+            program_id=program_id,
+            status='draft',
+            phone=request.data.get('phone', ''),
+            address=request.data.get('address', ''),
+            birth_date=request.data.get('birth_date') or None,
+        )
+        return Response(ApplicationSerializer(application).data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        application = self.get_object()
+        if application.applicant != request.user:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        # TOR requirement removed: applicants may submit without uploading a TOR.
+
+        # Prequalification gate removed: allow applicants to submit regardless of BSIT checks.
+        
+        application.status = 'submitted'
+        application.save()
+        return Response(ApplicationSerializer(application).data)
+    
+    @action(detail=True, methods=['post'])
+    def finalize(self, request, pk=None):
+        application = self.get_object()
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        application.status = 'finalized'
+        application.finalized_at = timezone.now()
+        note = ''
+        if isinstance(request.data, dict):
+            note = request.data.get('evaluator_note', '')
+        elif isinstance(request.data, str):
+            note = request.data
+        application.evaluator_note = note
+        application.save()
+        return Response(ApplicationSerializer(application).data)
+
+    @action(detail=True, methods=['post'])
+    def reopen(self, request, pk=None):
+        application = self.get_object()
+        # Only evaluators or admins can reopen a finalized application
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Reset previous review decisions so the evaluator can review the application again
+        # like a fresh under-review case and approve or reject matches manually.
+        SubjectMatch.objects.filter(application=application).update(
+            status='pending',
+            evaluator_note='',
+            flagged_by_applicant=False,
+            applicant_note=''
+        )
+
+        application.status = 'under_review'
+        application.finalized_at = None
+        application.evaluator_note = ''
+        application.save()
+        return Response(ApplicationSerializer(application).data)
+    
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        application = self.get_object()
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        application.status = 'rejected'
+        note = ''
+        if isinstance(request.data, dict):
+            note = request.data.get('evaluator_note', '')
+        elif isinstance(request.data, str):
+            note = request.data
+        application.evaluator_note = note
+        application.save()
+        return Response(ApplicationSerializer(application).data)
+
+    @action(detail=True, methods=['get'])
+    def summary(self, request, pk=None):
+        """Generate a short applicant summary for Department Chair based on work experience and uploaded job docs."""
+        application = self.get_object()
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+        work_experiences = list(
+            WorkExperience.objects.filter(application=application).values(
+                'job_title', 'years', 'job_description'
+            )
+        )
+
+        job_docs = []
+        docs = ApplicantDocument.objects.filter(
+            application=application,
+            document_type='job_description',
+            ocr_status='completed'
+        )
+        for d in docs:
+            text = d.extracted_text or d.ocr_raw or ''
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    job_docs.append(parsed.get('job_description', '') or json.dumps(parsed))
+                elif isinstance(parsed, list):
+                    job_docs.append(' '.join(str(x) for x in parsed)[:500])
+                else:
+                    job_docs.append(str(parsed)[:500])
+            except Exception:
+                job_docs.append(str(text)[:500])
+
+        payload = {'work_experiences': work_experiences, 'job_docs': job_docs}
+
+        try:
+            summary = async_to_sync(gemini_service.summarize_applicant)(payload)
+            return Response(summary)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class WorkExperienceViewSet(viewsets.ModelViewSet):
+    serializer_class = WorkExperienceSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        application_id = self.request.query_params.get('application_id')
+        
+        if user.role in ['evaluator', 'admin']:
+            queryset = WorkExperience.objects.all()
+        else:
+            queryset = WorkExperience.objects.filter(application__applicant=user)
+        
+        if application_id:
+            queryset = queryset.filter(application_id=application_id)
+        
+        return queryset
+
+class TORDocumentViewSet(viewsets.ModelViewSet):
+    serializer_class = TORDocumentSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.role in ['evaluator', 'admin']:
+            return TORDocument.objects.all()
+        return TORDocument.objects.filter(application__applicant=user)
+
+class ApplicantDocumentViewSet(viewsets.ModelViewSet):
+    serializer_class = ApplicantDocumentSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        application_id = self.request.query_params.get('application_id')
+        
+        if user.role in ['evaluator', 'admin']:
+            queryset = ApplicantDocument.objects.all()
+        else:
+            queryset = ApplicantDocument.objects.filter(application__applicant=user)
+        
+        if application_id:
+            queryset = queryset.filter(application_id=application_id)
+        
+        return queryset
+
+    @action(detail=True, methods=['post'])
+    def reprocess(self, request, pk=None):
+        document = self.get_object()
+
+        if document.application.applicant != request.user and request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            from .upload_views import process_tor_ocr_sync, process_job_description_ocr_sync
+
+            file_bytes = None
+            from django.core.files.storage import default_storage
+            if not default_storage.exists(document.file_path):
+                return Response({'error': 'File not found on disk'}, status=status.HTTP_404_NOT_FOUND)
+
+            with default_storage.open(document.file_path, 'rb') as file_obj:
+                file_bytes = file_obj.read()
+
+            if document.document_type == 'tor':
+                TORSubject.objects.filter(application=document.application).delete()
+
+            import base64
+            file_base64 = base64.b64encode(file_bytes).decode('utf-8')
+
+            if document.document_type == 'tor':
+                process_tor_ocr_sync(document.id, file_base64)
+            elif document.document_type == 'job_description':
+                process_job_description_ocr_sync(document.id, file_base64)
+            else:
+                return Response(
+                    {'error': 'Reprocess is only available for TOR and Job Description documents.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            document.refresh_from_db()
+            return Response(ApplicantDocumentSerializer(document).data)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class SubjectMatchViewSet(viewsets.ModelViewSet):
+    serializer_class = SubjectMatchSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        application_id = self.request.query_params.get('application_id')
+        
+        if user.role in ['evaluator', 'admin']:
+            queryset = SubjectMatch.objects.all()
+        else:
+            queryset = SubjectMatch.objects.filter(
+                application__applicant=user,
+                application__status='finalized'
+            )
+        
+        if application_id:
+            queryset = queryset.filter(application_id=application_id)
+            if user.role not in ['evaluator', 'admin']:
+                queryset = queryset.filter(application__status='finalized')
+        
+        return queryset.select_related('tor_subject', 'curriculum_subject', 'work_experience')
+    
+    @action(detail=True, methods=['post'])
+    def flag(self, request, pk=None):
+        match = self.get_object()
+        if match.application.applicant != request.user:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        match.flagged_by_applicant = True
+        match.applicant_note = request.data.get('note', '')
+        match.save()
+        return Response(SubjectMatchSerializer(match).data)
+
+    @action(detail=True, methods=['get'])
+    def summary(self, request, pk=None):
+        """Generate a short applicant summary for Department Chair based on work experience and uploaded docs."""
+        application = self.get_object()
+        # Only evaluator or admin can fetch chair summary
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Gather evidence
+        work_experiences = list(WorkExperience.objects.filter(application=application).values('job_title', 'years', 'job_description'))
+        job_docs = []
+        docs = ApplicantDocument.objects.filter(application=application, document_type='job_description', ocr_status='completed')
+        for d in docs:
+            # prefer extracted_text then ocr_raw
+            text = d.extracted_text or d.ocr_raw or ''
+            # if it's JSON, try to parse and turn into summary
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    job_docs.append(parsed.get('job_description','') or json.dumps(parsed))
+                elif isinstance(parsed, list):
+                    job_docs.append(' '.join(str(x) for x in parsed)[:500])
+                else:
+                    job_docs.append(str(parsed)[:500])
+            except Exception:
+                job_docs.append(str(text)[:500])
+
+        payload = {'work_experiences': work_experiences, 'job_docs': job_docs}
+
+        try:
+            summary = async_to_sync(gemini_service.summarize_applicant)(payload)
+            return Response(summary)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        match = self.get_object()
+
+        # Enforce Rule 1: TOR subject units cannot be less than curriculum subject units
+        if match.source == 'tor' and match.tor_subject and match.curriculum_subject:
+            tor_units = float(match.tor_subject.units or 0)
+            cur_units = float(match.curriculum_subject.units or 0)
+            if tor_units < cur_units:
+                return Response(
+                    {'error': f'Cannot approve: Insufficient units (TOR subject "{match.tor_subject.code}" has {tor_units:g} unit(s), but curriculum requires {cur_units:g} unit(s)).'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        match.status = 'approved'
+        if request.data.get('note'):
+            match.evaluator_note = request.data.get('note')
+        match.save()
+
+        # Enforce 1-to-1 matching: remove other pending matches for the same TOR subject or Curriculum subject
+        if match.tor_subject_id:
+            SubjectMatch.objects.filter(
+                application=match.application,
+                tor_subject_id=match.tor_subject_id,
+                status='pending'
+            ).exclude(id=match.id).delete()
+
+        if match.curriculum_subject_id:
+            SubjectMatch.objects.filter(
+                application=match.application,
+                curriculum_subject_id=match.curriculum_subject_id,
+                status='pending'
+            ).exclude(id=match.id).delete()
+
+        return Response(SubjectMatchSerializer(match).data)
+    
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        match = self.get_object()
+        match.status = 'rejected'
+        match.evaluator_note = request.data.get('note', '')
+        match.save()
+        return Response(SubjectMatchSerializer(match).data)
+
+    @action(detail=False, methods=['post'], url_path='disregard-tor-subject')
+    def disregard_tor_subject(self, request):
+        """
+        Disregard an unmatched TOR subject — creates a rejected SubjectMatch with
+        no curriculum_subject. This moves the TOR subject out of the Unmatched list
+        and into the Rejected Subjects summary on the Department Chair panel.
+        """
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+        application_id = request.data.get('application_id')
+        tor_subject_id = request.data.get('tor_subject_id')
+        note = request.data.get('note', 'Disregarded — not applicable to any BSIT curriculum subject')
+
+        if not application_id or not tor_subject_id:
+            return Response(
+                {'error': 'application_id and tor_subject_id are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            application = Application.objects.get(id=application_id)
+        except Application.DoesNotExist:
+            return Response({'error': 'Application not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            tor_subject = TORSubject.objects.get(id=tor_subject_id, application=application)
+        except TORSubject.DoesNotExist:
+            return Response({'error': 'TOR subject not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Remove any existing pending matches for this TOR subject
+        SubjectMatch.objects.filter(
+            application=application,
+            tor_subject=tor_subject,
+            status='pending'
+        ).delete()
+
+        # Create (or update) a rejected match with no curriculum subject
+        existing = SubjectMatch.objects.filter(
+            application=application,
+            tor_subject=tor_subject,
+            curriculum_subject=None,
+        )
+        if existing.exists():
+            match = existing.first()
+            match.source = 'tor'
+            match.confidence = 0
+            match.status = 'rejected'
+            match.evaluator_note = note
+            match.matching_reason = 'Disregarded by evaluator — not applicable to any BSIT curriculum subject'
+            match.save()
+            existing.exclude(id=match.id).delete()
+            created = False
+        else:
+            match = SubjectMatch.objects.create(
+                application=application,
+                tor_subject=tor_subject,
+                curriculum_subject=None,
+                source='tor',
+                confidence=0,
+                status='rejected',
+                evaluator_note=note,
+                matching_reason='Disregarded by evaluator — not applicable to any BSIT curriculum subject'
+            )
+            created = True
+
+        return Response(SubjectMatchSerializer(match).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    def create(self, request, *args, **kwargs):
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        application_id = request.data.get('application_id')
+        curriculum_subject_id = request.data.get('curriculum_subject_id')
+        tor_subject_id = request.data.get('tor_subject_id')
+        work_experience_id = request.data.get('work_experience_id')
+        note = request.data.get('note', '')
+        
+        if not application_id or not curriculum_subject_id:
+            return Response({'error': 'application_id and curriculum_subject_id are required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        source = 'work_experience' if work_experience_id else 'tor'
+
+        # Enforce Rule 1: Unit sufficiency for TOR subjects
+        if source == 'tor' and tor_subject_id and curriculum_subject_id:
+            tor_subj = TORSubject.objects.filter(id=tor_subject_id).first()
+            cur_subj = CurriculumSubject.objects.filter(id=curriculum_subject_id).first()
+            if tor_subj and cur_subj:
+                tor_units = float(tor_subj.units or 0)
+                cur_units = float(cur_subj.units or 0)
+                if tor_units < cur_units:
+                    return Response(
+                        {'error': f'Cannot match: Applicant subject "{tor_subj.code}" has {tor_units:g} unit(s), but BSIT curriculum requires {cur_units:g} unit(s).'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+        existing_matches = SubjectMatch.objects.filter(
+            application_id=application_id,
+            curriculum_subject_id=curriculum_subject_id,
+        )
+        if existing_matches.exists():
+            match = existing_matches.first()
+            match.tor_subject_id = tor_subject_id if source == 'tor' else None
+            match.work_experience_id = work_experience_id if source == 'work_experience' else None
+            match.source = source
+            match.confidence = 100.0
+            match.status = 'approved'
+            match.evaluator_note = note or 'Manually matched and approved by evaluator'
+            match.save()
+            existing_matches.exclude(id=match.id).delete()
+            created = False
+        else:
+            match = SubjectMatch.objects.create(
+                application_id=application_id,
+                curriculum_subject_id=curriculum_subject_id,
+                tor_subject_id=tor_subject_id if source == 'tor' else None,
+                work_experience_id=work_experience_id if source == 'work_experience' else None,
+                source=source,
+                confidence=100.0,
+                status='approved',
+                evaluator_note=note or 'Manually matched and approved by evaluator'
+            )
+            created = True
+
+        # Enforce 1-to-1 matching: remove any other pending matches
+        if tor_subject_id:
+            SubjectMatch.objects.filter(
+                application_id=application_id,
+                tor_subject_id=tor_subject_id,
+                status='pending'
+            ).exclude(id=match.id).delete()
+        if curriculum_subject_id:
+            SubjectMatch.objects.filter(
+                application_id=application_id,
+                curriculum_subject_id=curriculum_subject_id,
+                status='pending'
+            ).exclude(id=match.id).delete()
+
+        return Response(SubjectMatchSerializer(match).data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def override(self, request, pk=None):
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        
+        match = self.get_object()
+        new_curriculum_id = request.data.get('curriculum_subject_id')
+        new_tor_subject_id = request.data.get('tor_subject_id')
+        new_work_experience_id = request.data.get('work_experience_id')
+
+        # Enforce Rule 1: Unit sufficiency
+        target_cur_id = new_curriculum_id or match.curriculum_subject_id
+        if new_tor_subject_id and target_cur_id:
+            tor_subj = TORSubject.objects.filter(id=new_tor_subject_id).first()
+            cur_subj = CurriculumSubject.objects.filter(id=target_cur_id).first()
+            if tor_subj and cur_subj:
+                tor_units = float(tor_subj.units or 0)
+                cur_units = float(cur_subj.units or 0)
+                if tor_units < cur_units:
+                    return Response(
+                        {'error': f'Cannot match: Applicant subject "{tor_subj.code}" has {tor_units:g} unit(s), but BSIT curriculum requires {cur_units:g} unit(s).'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+        if new_curriculum_id:
+            match.curriculum_subject_id = new_curriculum_id
+        if new_work_experience_id:
+            match.work_experience_id = new_work_experience_id
+            match.tor_subject = None
+            match.source = 'work_experience'
+        elif new_tor_subject_id:
+            match.tor_subject_id = new_tor_subject_id
+            match.work_experience = None
+            match.source = 'tor'
+
+        match.status = request.data.get('status', 'approved')
+        if 'note' in request.data:
+            match.evaluator_note = request.data.get('note', '')
+        match.save()
+
+        # Enforce 1-to-1 matching: remove other pending matches
+        if match.tor_subject_id:
+            SubjectMatch.objects.filter(
+                application=match.application,
+                tor_subject_id=match.tor_subject_id,
+                status='pending'
+            ).exclude(id=match.id).delete()
+        if match.curriculum_subject_id:
+            SubjectMatch.objects.filter(
+                application=match.application,
+                curriculum_subject_id=match.curriculum_subject_id,
+                status='pending'
+            ).exclude(id=match.id).delete()
+
+        return Response(SubjectMatchSerializer(match).data)
+
+    def destroy(self, request, *args, **kwargs):
+        if request.user.role not in ['evaluator', 'admin']:
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        return super().destroy(request, *args, **kwargs)
+
+class ChatConversationViewSet(viewsets.ModelViewSet):
+    serializer_class = ChatConversationSerializer
+    permission_classes = [AllowAny]
+    
+    def get_queryset(self):
+        if self.request.user.is_authenticated:
+            return ChatConversation.objects.filter(user=self.request.user)
+        return ChatConversation.objects.filter(user__isnull=True)
+    
+    def perform_create(self, serializer):
+        if self.request.user.is_authenticated:
+            serializer.save(user=self.request.user)
+        else:
+            serializer.save()
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def health_check(request):
+    return Response({
+        'status': 'ok',
+        'message': 'ACCREDIA API is running',
+        'version': '1.0.0'
+    })
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def dashboard_stats(request):
+    """Get dashboard statistics based on user role"""
+    user = request.user
+    stats = {}
+    
+    if user.role == 'applicant':
+        applications = Application.objects.filter(applicant=user)
+        stats = {
+            'total_applications': applications.count(),
+            'draft': applications.filter(status='draft').count(),
+            'submitted': applications.filter(status='submitted').count(),
+            'under_review': applications.filter(status='under_review').count(),
+            'finalized': applications.filter(status='finalized').count(),
+        }
+    elif user.role == 'evaluator':
+        applications = Application.objects.exclude(status='draft')
+        stats = {
+            'total': applications.count(),
+            'pending_review': applications.filter(status__in=['submitted', 'processing', 'under_review']).count(),
+            'finalized': applications.filter(status='finalized').count(),
+            'rejected': applications.filter(status='rejected').count(),
+        }
+    elif user.role == 'admin':
+        stats = {
+            'total_applications': Application.objects.count(),
+            'total_users': User.objects.count(),
+            'total_applicants': User.objects.filter(role='applicant').count(),
+            'total_evaluators': User.objects.filter(role='evaluator').count(),
+            'finalized_applications': Application.objects.filter(status='finalized').count(),
+            'pending_applications': Application.objects.exclude(status__in=['finalized', 'rejected', 'draft']).count(),
+        }
+    
+    return Response(stats)

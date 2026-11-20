@@ -1,0 +1,153 @@
+from pathlib import Path
+import os
+from dotenv import load_dotenv
+from datetime import timedelta
+from urllib.parse import urlparse
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / '.env')
+
+SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-this')
+DEBUG = True
+ALLOWED_HOSTS = ['*']
+
+DATABASE_URL = os.getenv('DATABASE_URL', '')
+
+INSTALLED_APPS = [
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+    'rest_framework',
+    'rest_framework_simplejwt',
+    'corsheaders',
+    'core',
+]
+
+MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
+ROOT_URLCONF = 'accredia.urls'
+
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = 'accredia.wsgi.application'
+
+if DATABASE_URL:
+    parsed_database_url = urlparse(DATABASE_URL)
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': parsed_database_url.path.lstrip('/'),
+            'USER': parsed_database_url.username,
+            'PASSWORD': parsed_database_url.password,
+            'HOST': parsed_database_url.hostname,
+            'PORT': parsed_database_url.port,
+            'OPTIONS': {
+                'connect_timeout': 30,
+            },
+        }
+    }
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+
+AUTH_PASSWORD_VALIDATORS = [
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
+]
+
+LANGUAGE_CODE = 'en-us'
+TIME_ZONE = 'UTC'
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = 'static/'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+SUPABASE_STORAGE_BUCKET = os.getenv('SUPABASE_STORAGE_BUCKET', '').strip()
+if SUPABASE_STORAGE_BUCKET:
+    STORAGES = {
+        'default': {
+            'BACKEND': 'core.supabase_storage.SupabaseStorage',
+        },
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    }
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = True
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+}
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=7),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
+    'ROTATE_REFRESH_TOKENS': False,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'AUTH_HEADER_TYPES': ('Bearer',),
+}
+
+AUTH_USER_MODEL = 'core.User'
+
+_supabase_url_env = os.getenv('SUPABASE_URL', '').strip()
+if _supabase_url_env:
+    SUPABASE_URL = _supabase_url_env
+elif DATABASE_URL:
+    _parsed_supabase_db_url = urlparse(DATABASE_URL)
+    _supabase_username = _parsed_supabase_db_url.username or ''
+    _supabase_project_ref = _supabase_username.split('.', 1)[1] if '.' in _supabase_username else ''
+    SUPABASE_URL = f'https://{_supabase_project_ref}.supabase.co' if _supabase_project_ref else ''
+else:
+    SUPABASE_URL = ''
+
+SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
+SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
+
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET')
+
+# Maximum Upload Limits (100MB to support large multi-page high-DPI PDFs and mobile photos)
+DATA_UPLOAD_MAX_MEMORY_SIZE = 104857600   # 100MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 104857600   # 100MB
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 10000
