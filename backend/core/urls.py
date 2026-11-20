@@ -29,5 +29,8 @@ urlpatterns = [
     path('recommend-course/', upload_views.recommend_course, name='recommend-course'),
     path('predictions/', upload_views.get_predictions, name='get-predictions'),
     path('chat/message/', upload_views.chat_message, name='chat-message'),
+    path('applications/<uuid:application_id>/certificate-valuation/', upload_views.get_certificate_valuation, name='certificate-valuation'),
+    path('applications/<uuid:application_id>/certificate-valuation/audit/', upload_views.save_certificate_audit_decision, name='certificate-audit'),
+    path('certificate-review/uat-feedback/', upload_views.record_uat_feedback, name='certificate-uat-feedback'),
     path('', include(router.urls)),
 ]

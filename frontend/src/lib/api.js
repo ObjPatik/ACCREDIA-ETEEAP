@@ -116,3 +116,14 @@ export const dashboardApi = {
 export const courseApi = {
   recommend: (workExperiences) => apiClient.post('/recommend-course/', { work_experiences: workExperiences }),
 };
+
+export const certificateApi = {
+  getValuation: (applicationId, documentId = null) =>
+    apiClient.get(`/applications/${applicationId}/certificate-valuation/`, {
+      params: documentId ? { document_id: documentId } : {},
+    }),
+  saveAuditDecision: (applicationId, data) =>
+    apiClient.post(`/applications/${applicationId}/certificate-valuation/audit/`, data),
+  recordUatFeedback: (data) =>
+    apiClient.post('/certificate-review/uat-feedback/', data),
+};
