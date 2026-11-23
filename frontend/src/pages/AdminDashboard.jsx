@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Navbar } from '../components/Navbar';
 import { Card } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
@@ -8,6 +9,7 @@ import { Users, FileText, GraduationCap, BookOpen, Loader2, BarChart } from 'luc
 import { toast } from 'sonner';
 
 export const AdminDashboard = () => {
+  const navigate = useNavigate();
   const [stats, setStats] = useState({});
   const [applications, setApplications] = useState([]);
   const [curriculum, setCurriculum] = useState([]);
@@ -99,7 +101,14 @@ export const AdminDashboard = () => {
                   <p className="text-gray-500 text-center py-8">No applications yet</p>
                 ) : (
                   applications.map(app => (
-                    <div key={app.id} className="border border-gray-200 rounded-lg p-3" data-testid={`admin-app-${app.id}`}>
+                    <button
+                      key={app.id}
+                      type="button"
+                      className="w-full text-left border border-gray-200 rounded-lg p-3 hover:border-maroon/30 hover:shadow-sm smooth-transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-maroon"
+                      onClick={() => navigate(`/evaluator/review/${app.id}`)}
+                      aria-label={`View application for ${app.applicant?.full_name || 'applicant'}`}
+                      data-testid={`admin-app-${app.id}`}
+                    >
                       <div className="flex items-center justify-between">
                         <div>
                           <div className="font-semibold">{app.applicant?.full_name}</div>
@@ -110,7 +119,7 @@ export const AdminDashboard = () => {
                         </div>
                         <Badge variant="outline">{app.status?.replace('_', ' ').toUpperCase()}</Badge>
                       </div>
-                    </div>
+                    </button>
                   ))
                 )}
               </div>
