@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Navbar } from '../components/Navbar';
 import { Button } from '../components/ui/button';
@@ -14,6 +14,14 @@ import {
   Loader2, X, Sparkles, Plus, FileCheck, AlertCircle, Trash2
 } from 'lucide-react';
 import { toast } from 'sonner';
+
+const TOR_UPLOAD_STEPS = [
+  'Uploading transcript to secure cloud...',
+  'Scanning pages with PyMuPDF & RapidOCR...',
+  'Extracting subject codes, descriptions & grades...',
+  'Parsing academic units and evaluating completeness...',
+  'Almost done, saving extracted subjects...',
+];
 
 export const ApplyPage = () => {
   const { id } = useParams();
@@ -48,20 +56,12 @@ export const ApplyPage = () => {
   const [prequalificationError, setPrequalificationError] = useState('');
   const [prequalificationCauses, setPrequalificationCauses] = useState([]);
 
-  const torUploadSteps = [
-    'Uploading transcript to secure cloud...',
-    'Scanning pages with PyMuPDF & RapidOCR...',
-    'Extracting subject codes, descriptions & grades...',
-    'Parsing academic units and evaluating completeness...',
-    'Almost done, saving extracted subjects...',
-  ];
-
   useEffect(() => {
     let interval;
     if (uploadingTorModal) {
       setTorUploadStepIndex(0);
       interval = setInterval(() => {
-        setTorUploadStepIndex((prev) => (prev + 1) % torUploadSteps.length);
+        setTorUploadStepIndex((prev) => (prev + 1) % TOR_UPLOAD_STEPS.length);
       }, 3000);
     }
     return () => {
@@ -132,10 +132,6 @@ export const ApplyPage = () => {
   }, [application]);
 
   useEffect(() => {
-    loadApplication();
-  }, [id]);
-
-  useEffect(() => {
     return () => {
       if (pollRef.current) {
         clearInterval(pollRef.current);
@@ -148,7 +144,7 @@ export const ApplyPage = () => {
     };
   }, []);
 
-  const loadApplication = async () => {
+  const loadApplication = useCallback(async () => {
     try {
       const response = await applicationApi.get(id);
       setApplication(response.data);
@@ -164,7 +160,11 @@ export const ApplyPage = () => {
       navigate('/applicant');
     }
     setLoading(false);
-  };
+  }, [id, navigate]);
+
+  useEffect(() => {
+    loadApplication();
+  }, [loadApplication]);
 
   const savePersonalInfo = async () => {
     // Validate required personal info fields
@@ -1098,7 +1098,7 @@ export const ApplyPage = () => {
               <div className="w-full bg-gray-50 border border-gray-100 rounded-xl p-3 mb-4 shadow-2xs">
                 <div className="flex items-center justify-center gap-2 text-xs font-semibold text-maroon">
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-maroon flex-shrink-0" />
-                  <span className="transition-all duration-300">{torUploadSteps[torUploadStepIndex]}</span>
+                  <span className="transition-all duration-300">{TOR_UPLOAD_STEPS[torUploadStepIndex]}</span>
                 </div>
               </div>
 
