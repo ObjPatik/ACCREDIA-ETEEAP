@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Navbar } from '../components/Navbar';
 import { DocumentPreviewModal } from '../components/DocumentPreviewModal';
@@ -59,8 +59,10 @@ export const EvaluatorReviewPage = () => {
   const [matches, setMatches] = useState([]);
   const [prediction, setPrediction] = useState(null);
   const [curriculum, setCurriculum] = useState([]);
+  const curriculumRef = useRef(curriculum);
   const [torSubjects, setTorSubjects] = useState([]);
   const [appSummary, setAppSummary] = useState(null);
+  const appSummaryRef = useRef(appSummary);
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -385,10 +387,14 @@ export const EvaluatorReviewPage = () => {
   };
 
   useEffect(() => {
-    loadData();
-  }, [id]);
+    curriculumRef.current = curriculum;
+  }, [curriculum]);
 
-  const loadData = async (forceReloadAll = false) => {
+  useEffect(() => {
+    appSummaryRef.current = appSummary;
+  }, [appSummary]);
+
+  const loadData = useCallback(async (forceReloadAll = false) => {
     let loadedApplication = null;
     let loadedMatches = [];
     try {
@@ -407,22 +413,27 @@ export const EvaluatorReviewPage = () => {
       setFinalizationComplete(appResp.data.status === 'finalized' || appResp.data.status === 'rejected');
       
       // Load curriculum once on initial page load (curriculum is static)
-      if (forceReloadAll || curriculum.length === 0) {
+      if (forceReloadAll || curriculumRef.current.length === 0) {
         if (appResp.data && appResp.data.program && appResp.data.program.id) {
           try {
             const curResp = await programApi.curriculum(appResp.data.program.id);
-            setCurriculum(curResp.data || []);
+            const loadedCurriculum = curResp.data || [];
+            curriculumRef.current = loadedCurriculum;
+            setCurriculum(loadedCurriculum);
           } catch (e) {
+            curriculumRef.current = [];
             setCurriculum([]);
           }
         }
       }
 
       // Load AI summary once on initial page load (prevents repeated 5s Gemini API calls on every action!)
-      if (forceReloadAll || !appSummary) {
+      if (forceReloadAll || !appSummaryRef.current) {
         try {
           const sumResp = await applicationApi.summary(id);
-          setAppSummary(sumResp.data || null);
+          const loadedSummary = sumResp.data || null;
+          appSummaryRef.current = loadedSummary;
+          setAppSummary(loadedSummary);
         } catch (e) {
           // ignore summary errors
         }
@@ -432,7 +443,11 @@ export const EvaluatorReviewPage = () => {
     }
     setLoading(false);
     return { application: loadedApplication, matches: loadedMatches };
-  };
+  }, [id]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   const handleApproveMatch = async (matchId) => {
     if (approvingMatchId) return;
@@ -874,13 +889,14 @@ export const EvaluatorReviewPage = () => {
 
   // Set first term open by default when data loads
   useEffect(() => {
-    if (termGroups.length > 0 && Object.keys(expandedTerms).length === 0) {
+    setExpandedTerms((current) => {
+      if (termGroups.length === 0 || Object.keys(current).length > 0) return current;
       const initial = {};
       termGroups.forEach((g, idx) => {
         if (idx === 0) initial[g.key] = true;
       });
-      setExpandedTerms(initial);
-    }
+      return initial;
+    });
   }, [termGroups]);
 
   // Approved curriculum IDs

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Navbar } from '../components/Navbar';
 import { Button } from '../components/ui/button';
@@ -21,11 +21,7 @@ export const EvaluationPage = () => {
   const [prediction, setPrediction] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    loadData();
-  }, [id]);
-
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       const appResp = await applicationApi.get(id);
       const app = appResp.data;
@@ -48,7 +44,11 @@ export const EvaluationPage = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [id]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   const downloadReport = () => {
     try {
